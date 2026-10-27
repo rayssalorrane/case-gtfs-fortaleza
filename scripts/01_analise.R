@@ -1,7 +1,7 @@
 # =============================================================================
 # Case FNP – O que o GTFS revela sobre o transporte coletivo de Fortaleza
 # Script 01: auditoria do GTFS, indicadores de oferta e cruzamento com
-#            população, renda e empregos (IPEA / Acesso a Oportunidades)
+#            população e renda (IBGE, Censo 2022) e empregos (IPEA)
 # -----------------------------------------------------------------------------
 # Autora: Rayssa Lorrane
 #
@@ -11,6 +11,7 @@
 #
 # Entradas: data/raw/gtfs_fortaleza.zip  (GTFS da ETUFOR, março/2026)
 #           data/raw/aop_*.gpkg          (IPEA, baixados pelo script 00)
+#           data/raw/censo2022/          (IBGE, baixados pelo script 00)
 # Saídas:   output/indicadores_gtfs.xlsx e output/figuras/*.png
 # =============================================================================
 
@@ -207,7 +208,7 @@ paradas_sf <- st_transform(st_as_sf(paradas, coords = c("lon", "lat"), crs = 432
 
 
 # =============================================================================
-# 6. CRUZAMENTO COM POPULAÇÃO, RENDA E EMPREGOS (IPEA)
+# 6. CRUZAMENTO COM POPULAÇÃO, RENDA (CENSO 2022) E EMPREGOS (IPEA)
 # =============================================================================
 
 hex <- st_transform(st_read(file.path(DIR_RAW, "aop_uso_solo_2019.gpkg"), quiet = TRUE), CRS_UTM)
@@ -234,28 +235,68 @@ hex <- merge(hex, part_hex, by = "id_hex", all.x = TRUE)
 hex$partidas_hora[is.na(hex$partidas_hora)] <- 0
 hex$paradas[is.na(hex$paradas)] <- 0
 
+# 6.1 População e renda do Censo 2022 nos hexágonos
+# Os dados de 2022 vêm por setor censitário. Cada setor é repartido entre os
+# hexágonos que ele toca, proporcionalmente à área (interpolação areal).
+DIR_CENSO <- file.path(DIR_RAW, "censo2022")
+COD_MUN   <- "2304400"   # Fortaleza
+ler_zip_csv <- function(zip, cols) {
+  arq <- unzip(file.path(DIR_CENSO, zip), exdir = tmp)
+  fread(arq, select = cols, colClasses = "character", encoding = "Latin-1", sep = ";")
+}
+num_br <- function(x) suppressWarnings(as.numeric(gsub(",", ".", x)))   # "X" (sigilo) vira NA
+
+basico <- ler_zip_csv("agregados_basico_BR.zip", c("CD_SETOR", "CD_MUN", "v0001"))[CD_MUN == COD_MUN]
+renda  <- ler_zip_csv("agregados_renda_responsavel_BR.zip", c("CD_SETOR", "V06001", "V06004"))[startsWith(CD_SETOR, COD_MUN)]
+censo  <- merge(basico[, .(CD_SETOR, pop = num_br(v0001))],
+                renda[, .(CD_SETOR, resp = num_br(V06001), renda_resp = num_br(V06004))], by = "CD_SETOR", all.x = TRUE)
+
+setores <- st_read(file.path(DIR_CENSO, "CE_setores_CD2022.gpkg"), quiet = TRUE)
+setores <- st_transform(setores[setores$CD_MUN == COD_MUN, "CD_SETOR"], CRS_UTM)
+pedacos <- st_intersection(st_make_valid(setores), hex[, "id_hex"])
+I <- data.table(CD_SETOR = pedacos$CD_SETOR, id_hex = pedacos$id_hex, a = as.numeric(st_area(pedacos)))
+I[, w := a / sum(a), by = CD_SETOR]          # parte do setor que cai em cada hexágono
+I <- merge(I, censo, by = "CD_SETOR")
+I[, tem_renda := !is.na(renda_resp) & !is.na(resp)]
+pop22 <- I[, .(P2022 = sum(pop * w, na.rm = TRUE),
+               renda_resp = sum((renda_resp * resp * w)[tem_renda]) / sum((resp * w)[tem_renda])), by = id_hex]
+pop22[!is.finite(renda_resp), renda_resp := NA_real_]
+hex <- merge(hex, pop22, by = "id_hex", all.x = TRUE)
+hex$P2022[is.na(hex$P2022)] <- 0
+cat("População 2022 nos hexágonos:", round(sum(hex$P2022)), "| no IBGE:", sum(censo$pop, na.rm = TRUE), "\n")
+
+# 6.2 Indicadores por quintil de renda (cada quintil reúne ~20% da população de 2022)
 H <- as.data.table(st_drop_geometry(hex))
 H[, c("P001", "T001", "CMATT60", "CMATT30") := lapply(.SD, as.numeric), .SDcols = c("P001", "T001", "CMATT60", "CMATT30")]
+H[, POP := P2022]
 total_empregos <- sum(H$T001)
-H[, quintil := factor(R002, levels = 1:5, labels = c("Q1 (20% mais pobres)", "Q2", "Q3", "Q4", "Q5 (20% mais ricos)"))]
+rotulos_q <- c("Q1 (20% mais pobres)", "Q2", "Q3", "Q4", "Q5 (20% mais ricos)")
+setorder(H, renda_resp, na.last = TRUE)
+H[POP > 0 & !is.na(renda_resp), acum := (cumsum(POP) - POP / 2) / sum(POP)]
+H[, quintil := factor(rotulos_q[pmin(5, floor(5 * acum) + 1)], levels = rotulos_q)]
 
+resumir <- function(d, peso) d[, .(populacao = sum(get(peso)),
+  pct_qualquer = 100 * sum(get(peso) * cob_qualquer) / sum(get(peso)),
+  pct_frequente = 100 * sum(get(peso) * cob_frequente) / sum(get(peso)),
+  empregos_60min_pct = 100 * weighted.mean(CMATT60, get(peso), na.rm = TRUE) / total_empregos)]
 cobertura <- rbind(
-  H[, .(grupo = "Total", populacao = sum(P001),
-        pct_qualquer = 100 * sum(P001 * cob_qualquer) / sum(P001),
-        pct_frequente = 100 * sum(P001 * cob_frequente) / sum(P001),
-        empregos_60min_pct = 100 * weighted.mean(CMATT60, P001, na.rm = TRUE) / total_empregos)],
-  H[!is.na(quintil), .(populacao = sum(P001),
-        pct_qualquer = 100 * sum(P001 * cob_qualquer) / sum(P001),
-        pct_frequente = 100 * sum(P001 * cob_frequente) / sum(P001),
-        empregos_60min_pct = 100 * weighted.mean(CMATT60, P001, na.rm = TRUE) / total_empregos),
-    by = .(grupo = quintil)][order(grupo)]
-)
+  cbind(grupo = "Total", resumir(H, "POP")),
+  H[!is.na(quintil), cbind(renda_media_resp = weighted.mean(renda_resp, POP), resumir(.SD, "POP")), by = .(grupo = quintil)][order(grupo)],
+  fill = TRUE)
+setcolorder(cobertura, c("grupo", "populacao", "renda_media_resp"))
 cobertura_empregos <- H[, .(empregos = sum(T001),
                             pct_empregos_frequente = 100 * sum(T001 * cob_frequente) / sum(T001))]
 print(cobertura); print(cobertura_empregos)
+cat("População de 2022 em hexágonos sem acessibilidade calculada pelo IPEA:",
+    sprintf("%.1f%%", 100 * H[is.na(CMATT60), sum(POP)] / sum(H$POP)), "\n")
+
+# Comparação: os mesmos indicadores com a população do Censo 2010 (grade do IPEA)
+comparacao_censos <- rbind(cbind(base = "Censo 2022 (IBGE, usado na análise)", resumir(H, "POP")),
+                           cbind(base = "Censo 2010 (IPEA)", resumir(H, "P001")))
+print(comparacao_censos)
 
 # População sem parada frequente a 500 m, por quintil
-sem_freq <- H[!is.na(quintil), .(pessoas_sem_freq = sum(P001 * (1 - cob_frequente))), by = quintil][order(quintil)]
+sem_freq <- H[!is.na(quintil), .(pessoas_sem_freq = sum(POP * (1 - cob_frequente))), by = quintil][order(quintil)]
 
 
 # =============================================================================
@@ -275,7 +316,7 @@ paradas_mapa$faixa <- cut(paradas_mapa$partidas_hora, c(0, 4, 12, 30, Inf),
                           labels = c("Até 4", "4 a 12", "12 a 30", "Mais de 30"))
 paradas_mapa <- paradas_mapa[order(paradas_mapa$partidas_hora), ]
 g_rede <- ggplot() +
-  geom_sf(data = hex, aes(fill = P001), colour = NA) +
+  geom_sf(data = hex, aes(fill = P2022), colour = NA) +
   scale_fill_gradient(low = "#F4F4F1", high = "#B9BCB4", guide = "none") +
   geom_sf(data = limite, fill = NA, colour = COR$tinta, linewidth = 0.3) +
   geom_sf(data = paradas_mapa, aes(colour = faixa, size = faixa), alpha = 0.85) +
@@ -286,7 +327,7 @@ ggsave(file.path(DIR_FIG, "mapa_rede.png"), g_rede, width = 8, height = 7.2, dpi
 
 # 7.2 Cobertura de serviço frequente sobre a população
 H_sf <- hex
-H_sf$categoria <- with(H_sf, ifelse(P001 == 0, "Sem moradores",
+H_sf$categoria <- with(H_sf, ifelse(P2022 < 1, "Sem moradores",
                        ifelse(cob_frequente >= 0.5, "Ônibus frequente a até 500 m",
                        ifelse(cob_qualquer >= 0.5, "Só ônibus pouco frequente", "Sem parada a até 500 m"))))
 H_sf$categoria <- factor(H_sf$categoria, levels = c("Ônibus frequente a até 500 m", "Só ônibus pouco frequente",
@@ -301,8 +342,8 @@ ggsave(file.path(DIR_FIG, "mapa_cobertura.png"), g_cob, width = 8, height = 7.2,
 # 7.3 Acessibilidade a empregos em 60 min (IPEA, calculada com GTFS de 2019)
 H_sf$acc60 <- 100 * H_sf$CMATT60 / total_empregos
 g_acc <- ggplot() +
-  geom_sf(data = H_sf[H_sf$P001 > 0, ], aes(fill = acc60), colour = NA) +
-  scale_fill_gradient(low = "#F4E3C9", high = COR$azul, name = "% dos empregos\nalcançáveis em\n60 min de ônibus", limits = c(0, 100)) +
+  geom_sf(data = H_sf[H_sf$P2022 >= 1, ], aes(fill = acc60), colour = NA) +
+  scale_fill_gradient(low = "#F4E3C9", high = COR$azul, name = "% dos empregos\nalcançáveis em\n60 min de ônibus", limits = c(0, 100), na.value = "#D9DCD6") +
   geom_sf(data = limite, fill = NA, colour = COR$tinta, linewidth = 0.3) +
   tema_mapa
 ggsave(file.path(DIR_FIG, "mapa_acesso_empregos.png"), g_acc, width = 8, height = 7.2, dpi = 220, bg = "white")
@@ -322,6 +363,7 @@ abas <- list(
   "Velocidade linhas"   = vel_linha,
   "Cobertura"           = cobertura,
   "Cobertura empregos"  = cobertura_empregos,
+  "Censo 2022 x 2010"   = comparacao_censos,
   "Sem servico freq"    = sem_freq
 )
 wb <- createWorkbook()

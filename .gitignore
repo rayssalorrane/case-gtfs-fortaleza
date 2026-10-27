@@ -17,3 +17,6 @@ Thumbs.db
 
 # GTFS descompactado (o script lê direto do .zip)
 data/gtfs/
+
+# Arquivo do IBGE baixado em teste e não usado
+data/raw/censo2022/agregados_domicilio1_BR.zip
